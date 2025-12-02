@@ -1,554 +1,450 @@
-from dataclasses import dataclass, field, asdict
+"""
+accounts.py
+
+A simple account management system for a trading simulation platform.
+
+This module implements:
+- Exceptions for account errors
+- get_share_price test resolver
+- Transaction and Position dataclasses
+- Account class with deposit/withdraw/buy/sell, holdings, PnL, transactions, serialization
+
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP, getcontext
-from typing import Callable, Dict, List, Optional, Any
+from typing import Optional, Literal, Callable, Dict, Any, List
 import uuid
 import threading
-
-# Set Decimal precision
-getcontext().prec = 28
-CENTS = Decimal('0.01')
+import copy
+import json
 
 # Exceptions
-
-
 class AccountError(Exception):
-    """Base class for account-specific errors."""
-    pass
+    """Base custom exception for account module."""
 
+class InvalidAmountError(AccountError):
+    pass
 
 class InsufficientFundsError(AccountError):
-    """Raised when a withdraw or buy would cause negative cash balance."""
     pass
-
 
 class InsufficientSharesError(AccountError):
-    """Raised when a sell attempts to sell more shares than held as of the operation timestamp."""
     pass
 
-
-class InvalidTransactionError(AccountError):
-    """Raised for invalid input amounts or invalid operations."""
+class UnknownSymbolError(AccountError):
     pass
 
-
-class PriceLookupError(AccountError):
-    """Raised when the price provider cannot supply a price."""
+class TransactionError(AccountError):
     pass
 
+# Module-level helper
+def get_share_price(symbol: str) -> float:
+    """Return fixed price for test symbols AAPL, TSLA, GOOGL; raise UnknownSymbolError otherwise.
 
-# Transaction dataclass
+    Accepts case-insensitive symbols.
+    """
+    if not symbol or not isinstance(symbol, str):
+        raise UnknownSymbolError(f"Unknown symbol: {symbol}")
+    prices = {
+        'AAPL': 150.0,
+        'TSLA': 700.0,
+        'GOOGL': 2800.0,
+    }
+    sym = symbol.upper()
+    try:
+        return prices[sym]
+    except KeyError:
+        raise UnknownSymbolError(f"Unknown symbol: {symbol}")
 
-
-@dataclass
+# Dataclasses
+@dataclass(frozen=True)
 class Transaction:
-    id: str
+    tx_id: str
     timestamp: datetime
-    type: str  # 'deposit', 'withdraw', 'buy', 'sell'
-    amount: Decimal  # cash delta: deposit +, withdraw -, buy -, sell +
-    symbol: Optional[str] = None
-    quantity: Optional[int] = None
-    price: Optional[Decimal] = None  # unit price
-    cash_balance_after: Decimal = field(default_factory=lambda: Decimal('0'))
+    type: Literal['deposit', 'withdraw', 'buy', 'sell']
+    symbol: Optional[str]
+    quantity: Optional[float]
+    price: Optional[float]
+    total: float
+    balance_after: float
     note: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            'id': self.id,
+            'tx_id': self.tx_id,
             'timestamp': self.timestamp.isoformat(),
             'type': self.type,
-            'amount': str(self.amount),
             'symbol': self.symbol,
             'quantity': self.quantity,
-            'price': (str(self.price) if self.price is not None else None),
-            'cash_balance_after': str(self.cash_balance_after),
+            'price': self.price,
+            'total': self.total,
+            'balance_after': self.balance_after,
             'note': self.note,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Transaction':
-        ts = datetime.fromisoformat(data['timestamp'])
-        amount = Decimal(data['amount'])
-        price = Decimal(data['price']) if data.get('price') is not None else None
-        cash_after = Decimal(data.get('cash_balance_after', '0'))
+        ts = data.get('timestamp')
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
         return cls(
-            id=data['id'],
+            tx_id=data['tx_id'],
             timestamp=ts,
             type=data['type'],
-            amount=amount,
             symbol=data.get('symbol'),
             quantity=data.get('quantity'),
-            price=price,
-            cash_balance_after=cash_after,
+            price=data.get('price'),
+            total=data['total'],
+            balance_after=data['balance_after'],
             note=data.get('note'),
         )
 
+@dataclass
+class Position:
+    symbol: str
+    quantity: float
+    avg_cost: float
+    realized_pnl: float = 0.0
 
-# Price provider type alias
-PriceProvider = Callable[[str, Optional[datetime]], Decimal]
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'symbol': self.symbol,
+            'quantity': self.quantity,
+            'avg_cost': self.avg_cost,
+            'realized_pnl': self.realized_pnl,
+        }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Position':
+        return cls(
+            symbol=data['symbol'],
+            quantity=data.get('quantity', 0.0),
+            avg_cost=data.get('avg_cost', 0.0),
+            realized_pnl=data.get('realized_pnl', 0.0),
+        )
 
-def _quantize_money(value: Decimal) -> Decimal:
-    return value.quantize(CENTS, rounding=ROUND_HALF_UP)
-
-
-def get_share_price(symbol: str, timestamp: Optional[datetime] = None) -> Decimal:
-    """
-    Default test price provider. Returns fixed Decimal prices for AAPL, TSLA, GOOGL.
-    Raises PriceLookupError for unknown symbols. Ignores timestamp.
-    """
-    mapping = {
-        'AAPL': Decimal('150.00'),
-        'TSLA': Decimal('700.00'),
-        'GOOGL': Decimal('2800.00'),
-    }
-    sym = symbol.upper()
-    if sym in mapping:
-        return mapping[sym]
-    raise PriceLookupError(f"No test price for symbol {symbol}")
-
+# Helper for rounding monetary amounts (cents precision)
+def _round_money(x: float) -> float:
+    try:
+        return round(float(x) + 0.0, 2)
+    except Exception:
+        return float(x)
 
 class Account:
-    """
-    Simple account management for trading simulation.
-    Append-only ledger semantics: transactions must have timestamp >= last transaction timestamp.
-    All timestamps are naive UTC datetimes (datetime.utcnow()).
+    """Represents a user's simulated trading account.
+
+    Public methods include deposit, withdraw, buy, sell, and reporting utilities.
     """
 
-    def __init__(
-        self,
-        account_id: Optional[str] = None,
-        initial_deposit: Decimal = Decimal('0'),
-        timestamp: Optional[datetime] = None,
-        price_provider: Optional[PriceProvider] = None,
-    ) -> None:
-        self.account_id = account_id or uuid.uuid4().hex
+    def __init__(self, user_id: str, initial_deposit: float = 0.0, currency: str = 'USD') -> None:
+        if not user_id or not isinstance(user_id, str):
+            raise ValueError("user_id must be a non-empty string")
+        self._user_id = user_id
+        self._currency = currency
+        self._cash = 0.0
+        self._initial_deposit = 0.0
+        self._positions: Dict[str, Position] = {}
         self._transactions: List[Transaction] = []
+        self._realized_pnl = 0.0
         self._lock = threading.Lock()
-        self._initial_deposit: Optional[Decimal] = None
-        self._price_provider: PriceProvider = price_provider or get_share_price
 
-        if initial_deposit is not None and Decimal(initial_deposit) > 0:
-            ts = timestamp or datetime.utcnow()
-            # ensure Decimal quantization
-            amt = _quantize_money(Decimal(initial_deposit))
-            with self._lock:
-                txn = Transaction(
-                    id=uuid.uuid4().hex,
-                    timestamp=ts,
-                    type='deposit',
-                    amount=amt,
-                    symbol=None,
-                    quantity=None,
-                    price=None,
-                    cash_balance_after=Decimal('0'),  # will be set in _append_transaction
-                    note='initial_deposit',
-                )
-                self._append_transaction(txn)
+        if initial_deposit:
+            if initial_deposit <= 0:
+                raise InvalidAmountError("Initial deposit must be > 0 if provided")
+            self._cash = _round_money(initial_deposit)
+            self._initial_deposit = _round_money(initial_deposit)
+            tx = Transaction(
+                tx_id=uuid.uuid4().hex,
+                timestamp=datetime.utcnow(),
+                type='deposit',
+                symbol=None,
+                quantity=None,
+                price=None,
+                total=_round_money(initial_deposit),
+                balance_after=self._cash,
+                note='initial_deposit'
+            )
+            self._transactions.append(tx)
+
+    # Internal helpers
+    def _record_transaction(self, tx: Transaction) -> None:
+        # Ensure consistency: set balance_after to current cash if mismatch
+        if _round_money(tx.balance_after) != _round_money(self._cash):
+            # Create a corrected transaction to append
+            corrected = Transaction(
+                tx_id=tx.tx_id,
+                timestamp=tx.timestamp,
+                type=tx.type,
+                symbol=tx.symbol,
+                quantity=tx.quantity,
+                price=tx.price,
+                total=tx.total,
+                balance_after=self._cash,
+                note=tx.note,
+            )
+            self._transactions.append(corrected)
+        else:
+            self._transactions.append(tx)
+
+    def _get_position(self, symbol: str) -> Optional[Position]:
+        return self._positions.get(symbol.upper())
+
+    # Public API
+    def deposit(self, amount: float, timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
+        if amount is None or amount <= 0:
+            raise InvalidAmountError("Deposit amount must be > 0")
+        with self._lock:
+            amt = _round_money(amount)
+            self._cash = _round_money(self._cash + amt)
+            if self._initial_deposit == 0.0:
                 self._initial_deposit = amt
+            tx = Transaction(
+                tx_id=uuid.uuid4().hex,
+                timestamp=timestamp or datetime.utcnow(),
+                type='deposit',
+                symbol=None,
+                quantity=None,
+                price=None,
+                total=amt,
+                balance_after=self._cash,
+                note=note,
+            )
+            self._record_transaction(tx)
+            return tx
 
-    # Internal helper to get last transaction timestamp
-    def _last_transaction_timestamp(self) -> Optional[datetime]:
-        if not self._transactions:
-            return None
-        return self._transactions[-1].timestamp
-
-    def _append_transaction(self, txn: Transaction) -> None:
-        """
-        Append-only semantics: only allow txn.timestamp >= last txn timestamp.
-        Acquire lock and append, compute cash_balance_after for this transaction.
-        """
+    def withdraw(self, amount: float, timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
+        if amount is None or amount <= 0:
+            raise InvalidAmountError("Withdraw amount must be > 0")
         with self._lock:
-            last_ts = self._last_transaction_timestamp()
-            if last_ts is not None and txn.timestamp < last_ts:
-                raise InvalidTransactionError(
-                    "Out-of-order transaction timestamps not allowed in this implementation."
-                )
-            # compute prior balance
-            prior_balance = Decimal('0')
-            if self._transactions:
-                prior_balance = self._transactions[-1].cash_balance_after
-            new_balance = _quantize_money(prior_balance + txn.amount)
-            txn.cash_balance_after = new_balance
-            self._transactions.append(txn)
+            amt = _round_money(amount)
+            if amt > self._cash + 1e-9:
+                raise InsufficientFundsError(f"Insufficient funds: attempting to withdraw {amt} with cash {self._cash}")
+            self._cash = _round_money(self._cash - amt)
+            tx = Transaction(
+                tx_id=uuid.uuid4().hex,
+                timestamp=timestamp or datetime.utcnow(),
+                type='withdraw',
+                symbol=None,
+                quantity=None,
+                price=None,
+                total=_round_money(-amt),
+                balance_after=self._cash,
+                note=note,
+            )
+            self._record_transaction(tx)
+            return tx
 
-    def deposit(self, amount: Decimal, timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
-        """
-        Deposit cash into account. amount must be > 0.
-        Sets _initial_deposit if this is the first deposit ever.
-        Returns the created Transaction.
-        """
-        if amount is None:
-            raise InvalidTransactionError("Amount is required for deposit.")
-        amt = Decimal(amount)
-        if amt <= 0:
-            raise InvalidTransactionError("Deposit amount must be greater than 0.")
-        amt = _quantize_money(amt)
-        ts = timestamp or datetime.utcnow()
-        txn = Transaction(
-            id=uuid.uuid4().hex,
-            timestamp=ts,
-            type='deposit',
-            amount=amt,
-            note=note,
-        )
-        self._append_transaction(txn)
+    def buy(self, symbol: str, quantity: float, price: Optional[float] = None,
+            timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
+        if not symbol or not isinstance(symbol, str):
+            raise TransactionError("Symbol must be a non-empty string for buy")
+        if quantity is None or quantity <= 0:
+            raise InvalidAmountError("Buy quantity must be > 0")
+        sym = symbol.upper()
         with self._lock:
-            if self._initial_deposit is None:
-                self._initial_deposit = amt
-        return txn
+            resolved_price = price if price is not None else get_share_price(sym)
+            if resolved_price is None:
+                raise UnknownSymbolError(f"Unknown symbol: {symbol}")
+            cost = _round_money(resolved_price * float(quantity))
+            if cost > self._cash + 1e-9:
+                raise InsufficientFundsError(f"Insufficient cash to buy {quantity} {sym} at {resolved_price} (cost {cost}), cash {self._cash}")
+            # Deduct cash
+            self._cash = _round_money(self._cash - cost)
+            pos = self._positions.get(sym)
+            if pos is None:
+                self._positions[sym] = Position(symbol=sym, quantity=float(quantity), avg_cost=_round_money(resolved_price), realized_pnl=0.0)
+            else:
+                old_qty = pos.quantity
+                old_avg = pos.avg_cost
+                new_qty = old_qty + float(quantity)
+                new_avg = 0.0
+                if new_qty > 0:
+                    new_avg = _round_money((old_avg * old_qty + resolved_price * float(quantity)) / new_qty)
+                pos.quantity = new_qty
+                pos.avg_cost = new_avg
+            tx = Transaction(
+                tx_id=uuid.uuid4().hex,
+                timestamp=timestamp or datetime.utcnow(),
+                type='buy',
+                symbol=sym,
+                quantity=float(quantity),
+                price=_round_money(resolved_price),
+                total=_round_money(-cost),
+                balance_after=self._cash,
+                note=note,
+            )
+            self._record_transaction(tx)
+            return tx
 
-    def withdraw(self, amount: Decimal, timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
-        """
-        Withdraw cash from account. amount must be > 0 and must not cause negative cash balance.
-        Returns the created Transaction.
-        """
-        if amount is None:
-            raise InvalidTransactionError("Amount is required for withdrawal.")
-        amt = Decimal(amount)
-        if amt <= 0:
-            raise InvalidTransactionError("Withdraw amount must be greater than 0.")
-        amt = _quantize_money(amt)
-        ts = timestamp or datetime.utcnow()
-        # check funds at timestamp
-        available = self.get_cash_balance(timestamp=ts)
-        if available < amt:
-            raise InsufficientFundsError("Insufficient funds for withdrawal.")
-        txn = Transaction(
-            id=uuid.uuid4().hex,
-            timestamp=ts,
-            type='withdraw',
-            amount=_quantize_money(-amt),
-            note=note,
-        )
-        self._append_transaction(txn)
-        return txn
+    def sell(self, symbol: str, quantity: float, price: Optional[float] = None,
+             timestamp: Optional[datetime] = None, note: Optional[str] = None) -> Transaction:
+        if not symbol or not isinstance(symbol, str):
+            raise TransactionError("Symbol must be a non-empty string for sell")
+        if quantity is None or quantity <= 0:
+            raise InvalidAmountError("Sell quantity must be > 0")
+        sym = symbol.upper()
+        with self._lock:
+            pos = self._positions.get(sym)
+            if pos is None or pos.quantity + 1e-9 < float(quantity):
+                raise InsufficientSharesError(f"Insufficient shares to sell {quantity} {sym}")
+            resolved_price = price if price is not None else get_share_price(sym)
+            proceeds = _round_money(resolved_price * float(quantity))
+            # Update cash
+            self._cash = _round_money(self._cash + proceeds)
+            # Compute realized pnl
+            realized = _round_money((resolved_price - pos.avg_cost) * float(quantity))
+            pos.realized_pnl = _round_money(pos.realized_pnl + realized)
+            pos.quantity = _round_money(pos.quantity - float(quantity))
+            if pos.quantity <= 0:
+                # remove position entirely
+                del self._positions[sym]
+            # Update account realized pnl
+            self._realized_pnl = _round_money(self._realized_pnl + realized)
+            tx = Transaction(
+                tx_id=uuid.uuid4().hex,
+                timestamp=timestamp or datetime.utcnow(),
+                type='sell',
+                symbol=sym,
+                quantity=float(quantity),
+                price=_round_money(resolved_price),
+                total=_round_money(proceeds),
+                balance_after=self._cash,
+                note=note,
+            )
+            self._record_transaction(tx)
+            return tx
 
-    def buy(
-        self,
-        symbol: str,
-        quantity: int,
-        price: Optional[Decimal] = None,
-        timestamp: Optional[datetime] = None,
-        price_provider: Optional[PriceProvider] = None,
-        note: Optional[str] = None
-    ) -> Transaction:
-        """
-        Buy shares. Validates funds and records transaction.
-        Raises InsufficientFundsError or PriceLookupError or InvalidTransactionError.
-        """
-        if not symbol or quantity is None:
-            raise InvalidTransactionError("Symbol and quantity are required for buy.")
-        if quantity <= 0:
-            raise InvalidTransactionError("Buy quantity must be > 0.")
-        ts = timestamp or datetime.utcnow()
-        provider = price_provider or self._price_provider
-        unit_price = None
-        if price is not None:
-            unit_price = Decimal(price)
-            if unit_price <= 0:
-                raise InvalidTransactionError("Price must be > 0.")
+    def get_cash_balance(self) -> float:
+        return _round_money(self._cash)
+
+    def get_holdings(self) -> Dict[str, Position]:
+        # Return a deep copy to prevent external mutation
+        return {k: copy.deepcopy(v) for k, v in self._positions.items()}
+
+    def get_portfolio_value(self, price_resolver: Optional[Callable[[str], float]] = None) -> float:
+        resolver = price_resolver or get_share_price
+        total = self._cash
+        for sym, pos in self._positions.items():
+            if pos.quantity <= 0:
+                continue
+            price = resolver(sym)
+            total += price * pos.quantity
+        return _round_money(total)
+
+    def total_deposits(self) -> float:
+        deposits = sum(tx.total for tx in self._transactions if tx.type == 'deposit')
+        return _round_money(deposits)
+
+    def total_withdrawals(self) -> float:
+        withdrawals = sum(-tx.total for tx in self._transactions if tx.type == 'withdraw')
+        return _round_money(withdrawals)
+
+    def get_profit_loss(self, reference: Literal['initial', 'net_invested'] = 'initial',
+                        price_resolver: Optional[Callable[[str], float]] = None) -> float:
+        current_total = self.get_portfolio_value(price_resolver)
+        if reference == 'initial':
+            base = self._initial_deposit
+        elif reference == 'net_invested':
+            base = self.total_deposits() - self.total_withdrawals()
         else:
-            try:
-                unit_price = provider(symbol, ts)
-            except Exception as e:
-                raise PriceLookupError(str(e))
-        if not isinstance(unit_price, Decimal):
-            unit_price = Decimal(unit_price)
-        unit_price = _quantize_money(unit_price)
-        total_cost = _quantize_money(unit_price * Decimal(quantity))
-        # check available cash at timestamp
-        available = self.get_cash_balance(timestamp=ts)
-        if available < total_cost:
-            raise InsufficientFundsError("Insufficient funds to execute buy order.")
-        txn = Transaction(
-            id=uuid.uuid4().hex,
-            timestamp=ts,
-            type='buy',
-            amount=_quantize_money(-total_cost),
-            symbol=symbol.upper(),
-            quantity=quantity,
-            price=unit_price,
-            note=note,
-        )
-        self._append_transaction(txn)
-        return txn
+            raise ValueError("reference must be 'initial' or 'net_invested'")
+        return _round_money(current_total - base)
 
-    def sell(
-        self,
-        symbol: str,
-        quantity: int,
-        price: Optional[Decimal] = None,
-        timestamp: Optional[datetime] = None,
-        price_provider: Optional[PriceProvider] = None,
-        note: Optional[str] = None
-    ) -> Transaction:
-        """
-        Sell shares. Validates holdings and records transaction.
-        Raises InsufficientSharesError or PriceLookupError or InvalidTransactionError.
-        """
-        if not symbol or quantity is None:
-            raise InvalidTransactionError("Symbol and quantity are required for sell.")
-        if quantity <= 0:
-            raise InvalidTransactionError("Sell quantity must be > 0.")
-        ts = timestamp or datetime.utcnow()
-        symbol_up = symbol.upper()
-        holdings = self.get_holdings(timestamp=ts)
-        held_qty = holdings.get(symbol_up, 0)
-        if held_qty < quantity:
-            raise InsufficientSharesError(f"Attempt to sell {quantity} shares but only {held_qty} held as of timestamp.")
-        provider = price_provider or self._price_provider
-        unit_price = None
-        if price is not None:
-            unit_price = Decimal(price)
-            if unit_price <= 0:
-                raise InvalidTransactionError("Price must be > 0.")
-        else:
-            try:
-                unit_price = provider(symbol_up, ts)
-            except Exception as e:
-                raise PriceLookupError(str(e))
-        if not isinstance(unit_price, Decimal):
-            unit_price = Decimal(unit_price)
-        unit_price = _quantize_money(unit_price)
-        total_proceeds = _quantize_money(unit_price * Decimal(quantity))
-        txn = Transaction(
-            id=uuid.uuid4().hex,
-            timestamp=ts,
-            type='sell',
-            amount=_quantize_money(total_proceeds),
-            symbol=symbol_up,
-            quantity=quantity,
-            price=unit_price,
-            note=note,
-        )
-        self._append_transaction(txn)
-        return txn
+    def list_transactions(self, start: Optional[datetime] = None, end: Optional[datetime] = None,
+                          tx_type: Optional[Literal['deposit', 'withdraw', 'buy', 'sell']] = None,
+                          symbol: Optional[str] = None) -> List[Transaction]:
+        res: List[Transaction] = []
+        sym_upper = symbol.upper() if symbol else None
+        for tx in self._transactions:
+            if start and tx.timestamp < start:
+                continue
+            if end and tx.timestamp > end:
+                continue
+            if tx_type and tx.type != tx_type:
+                continue
+            if sym_upper and (not tx.symbol or tx.symbol.upper() != sym_upper):
+                continue
+            res.append(copy.deepcopy(tx))
+        return res
 
-    def list_transactions(
-        self,
-        start: Optional[datetime] = None,
-        end: Optional[datetime] = None,
-        types: Optional[List[str]] = None
-    ) -> List[Transaction]:
-        """
-        Return chronologically ordered transactions filtered by optional start/end timestamps and types.
-        """
-        with self._lock:
-            result = []
-            for txn in self._transactions:
-                if start is not None and txn.timestamp < start:
-                    continue
-                if end is not None and txn.timestamp > end:
-                    continue
-                if types is not None and txn.type not in types:
-                    continue
-                result.append(txn)
-            return list(result)
-
-    def get_transaction_by_id(self, txn_id: str) -> Optional[Transaction]:
-        with self._lock:
-            for txn in self._transactions:
-                if txn.id == txn_id:
-                    return txn
-        return None
-
-    def get_cash_balance(self, timestamp: Optional[datetime] = None) -> Decimal:
-        """
-        Compute cash balance at timestamp by replaying transactions up to and including timestamp.
-        If timestamp is None, returns latest balance.
-        """
-        with self._lock:
-            if not self._transactions:
-                return _quantize_money(Decimal('0'))
-            if timestamp is None:
-                return _quantize_money(self._transactions[-1].cash_balance_after)
-            balance = Decimal('0')
-            for txn in self._transactions:
-                if txn.timestamp <= timestamp:
-                    balance += txn.amount
-            return _quantize_money(balance)
-
-    def get_holdings(self, timestamp: Optional[datetime] = None) -> Dict[str, int]:
-        """
-        Compute holdings (symbol -> net quantity) at timestamp by replaying buy/sell transactions.
-        """
-        with self._lock:
-            holdings: Dict[str, int] = {}
-            for txn in self._transactions:
-                if timestamp is not None and txn.timestamp > timestamp:
-                    break
-                if txn.type == 'buy' and txn.symbol and txn.quantity:
-                    sym = txn.symbol.upper()
-                    holdings[sym] = holdings.get(sym, 0) + int(txn.quantity)
-                elif txn.type == 'sell' and txn.symbol and txn.quantity:
-                    sym = txn.symbol.upper()
-                    holdings[sym] = holdings.get(sym, 0) - int(txn.quantity)
-            # remove zero entries
-            holdings = {s: q for s, q in holdings.items() if q != 0}
-            return holdings
-
-    def get_portfolio_value(
-        self,
-        timestamp: Optional[datetime] = None,
-        price_provider: Optional[PriceProvider] = None
-    ) -> Decimal:
-        """
-        Compute total equity = cash balance + market value of holdings at timestamp using price_provider.
-        """
-        provider = price_provider or self._price_provider
-        cash = self.get_cash_balance(timestamp=timestamp)
-        holdings = self.get_holdings(timestamp=timestamp)
-        total_holdings_value = Decimal('0')
-        for symbol, qty in holdings.items():
-            try:
-                price = provider(symbol, timestamp)
-            except Exception as e:
-                raise PriceLookupError(str(e))
-            if not isinstance(price, Decimal):
-                price = Decimal(price)
-            price = _quantize_money(price)
-            symbol_value = _quantize_money(price * Decimal(qty))
-            total_holdings_value += symbol_value
-        total = _quantize_money(cash + total_holdings_value)
-        return total
-
-    def get_profit_loss(
-        self,
-        timestamp: Optional[datetime] = None,
-        basis: str = 'initial',
-        price_provider: Optional[PriceProvider] = None
-    ) -> Decimal:
-        """
-        Compute profit or loss at timestamp.
-        basis: 'initial' uses the first deposit, 'net' uses net deposits (deposits - withdrawals) up to timestamp.
-        Returns Decimal (positive => profit, negative => loss).
-        """
-        equity = self.get_portfolio_value(timestamp=timestamp, price_provider=price_provider)
-        if basis == 'initial':
-            if self._initial_deposit is None:
-                raise InvalidTransactionError("No initial deposit recorded for 'initial' basis P/L calculation.")
-            pl = equity - self._initial_deposit
-            return _quantize_money(pl)
-        elif basis == 'net':
-            # compute net deposits up to timestamp
-            net = Decimal('0')
-            with self._lock:
-                for txn in self._transactions:
-                    if timestamp is not None and txn.timestamp > timestamp:
-                        break
-                    if txn.type == 'deposit' or txn.type == 'withdraw':
-                        net += txn.amount
-            return _quantize_money(equity - _quantize_money(net))
-        else:
-            raise InvalidTransactionError("basis must be 'initial' or 'net'")
-
-    def get_account_summary(
-        self,
-        timestamp: Optional[datetime] = None,
-        price_provider: Optional[PriceProvider] = None
-    ) -> Dict[str, Any]:
-        """
-        Convenience summary:
-        {
-            'cash_balance': Decimal,
-            'holdings': {symbol: quantity},
-            'holdings_value': Decimal,
-            'total_equity': Decimal,
-            'profit_loss_initial': Decimal or None,
-            'profit_loss_net': Decimal
-        }
-        """
-        provider = price_provider or self._price_provider
-        cash = self.get_cash_balance(timestamp=timestamp)
-        holdings = self.get_holdings(timestamp=timestamp)
-        holdings_value = Decimal('0')
-        for symbol, qty in holdings.items():
-            price = provider(symbol, timestamp)
-            if not isinstance(price, Decimal):
-                price = Decimal(price)
-            price = _quantize_money(price)
-            holdings_value += _quantize_money(price * Decimal(qty))
-        total_equity = _quantize_money(cash + holdings_value)
-        try:
-            pl_initial = None
-            if self._initial_deposit is not None:
-                pl_initial = self.get_profit_loss(timestamp=timestamp, basis='initial', price_provider=provider)
-        except InvalidTransactionError:
-            pl_initial = None
-        pl_net = self.get_profit_loss(timestamp=timestamp, basis='net', price_provider=provider)
+    def get_realized_unrealized_pnl_breakdown(self, price_resolver: Optional[Callable[[str], float]] = None) -> Dict[str, float]:
+        resolver = price_resolver or get_share_price
+        realized = 0.0
+        unrealized = 0.0
+        for sym, pos in self._positions.items():
+            realized += pos.realized_pnl
+            if pos.quantity > 0:
+                price = resolver(sym)
+                unrealized += (price - pos.avg_cost) * pos.quantity
         return {
-            'cash_balance': cash,
-            'holdings': holdings,
-            'holdings_value': _quantize_money(holdings_value),
-            'total_equity': total_equity,
-            'profit_loss_initial': pl_initial,
-            'profit_loss_net': pl_net,
+            'realized_pnl': _round_money(realized),
+            'unrealized_pnl': _round_money(unrealized),
+            'total_pnl': _round_money(realized + unrealized),
         }
 
     def to_dict(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                'account_id': self.account_id,
-                'initial_deposit': (str(self._initial_deposit) if self._initial_deposit is not None else None),
-                'transactions': [txn.to_dict() for txn in self._transactions],
-            }
+        return {
+            'user_id': self._user_id,
+            'currency': self._currency,
+            'cash': self._cash,
+            'initial_deposit': self._initial_deposit,
+            'positions': {k: v.to_dict() for k, v in self._positions.items()},
+            'transactions': [tx.to_dict() for tx in self._transactions],
+            'realized_pnl': self._realized_pnl,
+        }
 
     @classmethod
-    def load_from_dict(cls, data: Dict[str, Any], price_provider: Optional[PriceProvider] = None) -> 'Account':
-        """
-        Rebuild an Account from a dict produced by to_dict.
-        Note: Reconstructed transactions will be appended in the order provided.
-        """
-        acct = cls(account_id=data.get('account_id'), price_provider=price_provider)
-        txns = data.get('transactions', [])
-        # Clear any initial deposit created by __init__
-        acct._transactions = []
-        acct._initial_deposit = Decimal(data['initial_deposit']) if data.get('initial_deposit') is not None else None
-        for t in txns:
-            txn = Transaction.from_dict(t)
-            # Ensure fields quantized
-            txn.amount = _quantize_money(txn.amount)
-            if txn.price is not None:
-                txn.price = _quantize_money(txn.price)
-            txn.cash_balance_after = _quantize_money(txn.cash_balance_after)
-            acct._append_transaction(txn)
+    def from_dict(cls, data: Dict[str, Any]) -> 'Account':
+        acct = cls(user_id=data.get('user_id', 'unknown'), initial_deposit=0.0, currency=data.get('currency', 'USD'))
+        acct._cash = _round_money(data.get('cash', 0.0))
+        acct._initial_deposit = _round_money(data.get('initial_deposit', 0.0))
+        acct._realized_pnl = _round_money(data.get('realized_pnl', 0.0))
+        acct._positions = {k: Position.from_dict(v) for k, v in data.get('positions', {}).items()}
+        acct._transactions = [Transaction.from_dict(tx) for tx in data.get('transactions', [])]
         return acct
 
-    # Optional utility
-    def reconcile_holdings(self) -> None:
-        """
-        Sanity check: ensures no negative holdings at any point in ledger.
-        Raises AssertionError if inconsistency detected.
-        """
+    def _reset(self) -> None:
+        """Reset account to empty state. For testing only."""
         with self._lock:
-            running: Dict[str, int] = {}
-            for txn in self._transactions:
-                if txn.type == 'buy' and txn.symbol and txn.quantity:
-                    running[txn.symbol] = running.get(txn.symbol, 0) + int(txn.quantity)
-                elif txn.type == 'sell' and txn.symbol and txn.quantity:
-                    running[txn.symbol] = running.get(txn.symbol, 0) - int(txn.quantity)
-                    if running[txn.symbol] < 0:
-                        raise AssertionError(f"Negative holdings for {txn.symbol} after transaction {txn.id}")
+            self._cash = 0.0
+            self._initial_deposit = 0.0
+            self._positions.clear()
+            self._transactions.clear()
+            self._realized_pnl = 0.0
 
-    def export_transactions_csv(self, filepath: str) -> None:
-        """
-        Export transactions to CSV (basic).
-        """
-        import csv
-        with self._lock:
-            with open(filepath, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['id', 'timestamp', 'type', 'amount', 'symbol', 'quantity', 'price', 'cash_balance_after', 'note'])
-                for txn in self._transactions:
-                    writer.writerow([
-                        txn.id,
-                        txn.timestamp.isoformat(),
-                        txn.type,
-                        str(txn.amount),
-                        txn.symbol or '',
-                        txn.quantity or '',
-                        str(txn.price) if txn.price is not None else '',
-                        str(txn.cash_balance_after),
-                        txn.note or '',
-                    ])
+# If executed as script, demonstrate a simple scenario and run basic assertions
+if __name__ == '__main__':
+    # Simple smoke tests
+    acct = Account('alice', initial_deposit=10000.0)
+    print('Initial cash:', acct.get_cash_balance())
+
+    tx1 = acct.buy('AAPL', 10)
+    print('After buy 10 AAPL cash:', acct.get_cash_balance())
+    tx2 = acct.sell('AAPL', 2)
+    print('After sell 2 AAPL cash:', acct.get_cash_balance())
+    pv = acct.get_portfolio_value()
+    print('Portfolio value:', pv)
+    pnl = acct.get_profit_loss('initial')
+    print('Profit/Loss vs initial:', pnl)
+
+    # List transactions
+    for tx in acct.list_transactions():
+        print(tx.to_dict())
+
+    # Attempt invalid operations
+    try:
+        acct.withdraw(20000)
+    except InsufficientFundsError as e:
+        print('Expected error:', e)
+
+    try:
+        acct.sell('AAPL', 1000)
+    except InsufficientSharesError as e:
+        print('Expected error:', e)
+
+    # Test serialization
+    data = acct.to_dict()
+    acct2 = Account.from_dict(data)
+    print('Deserialized cash:', acct2.get_cash_balance())
