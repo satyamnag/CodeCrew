@@ -1,197 +1,208 @@
-from decimal import Decimal, InvalidOperation
+from datetime import datetime
 import gradio as gr
-from typing import Optional, Any, Dict, List
-from accounts import Account, get_share_price, Transaction
-from accounts import AccountError, InsufficientFundsError, InsufficientSharesError, InvalidTransactionError, PriceLookupError
+from accounts import Account, get_share_price, AccountError
 
-# Helper utilities
+# Simple global single-account for demo
+_account = None  # type: Account | None
 
+# Helpers
+def _fmt_money(x: float) -> str:
+    return f"${x:,.2f}"
 
-def fmt_money(d: Decimal) -> str:
+def _ensure_account():
+    if _account is None:
+        raise RuntimeError("No account exists. Create an account first.")
+
+def create_account(user_id: str, initial_deposit: float):
+    global _account
+    if not user_id:
+        return "Error: user_id must be provided."
     try:
-        return f"${d:.2f}"
-    except Exception:
-        # Decimal formatting fallback
-        return f"${str(d)}"
-
-
-def account_to_summary_dict(acct: Optional[Account]) -> Dict[str, Any]:
-    if acct is None:
-        return {"message": "No account created yet."}
-    s = acct.get_account_summary(price_provider=get_share_price)
-    # Convert Decimals to strings for JSON-friendly display
-    return {
-        "cash_balance": fmt_money(s["cash_balance"]),
-        "holdings": s["holdings"],
-        "holdings_value": fmt_money(s["holdings_value"]),
-        "total_equity": fmt_money(s["total_equity"]),
-        "profit_loss_initial": (fmt_money(s["profit_loss_initial"]) if s["profit_loss_initial"] is not None else None),
-        "profit_loss_net": fmt_money(s["profit_loss_net"]),
-    }
-
-
-def transactions_to_list(acct: Optional[Account]) -> List[Dict[str, Any]]:
-    if acct is None:
-        return []
-    txns = acct.list_transactions()
-    return [t.to_dict() for t in txns]
-
-
-# Action handlers
-
-
-def handle_create_account(initial_deposit: str, acct_state: Optional[Account]):
-    try:
-        if initial_deposit is None or initial_deposit == "":
-            acct = Account()  # empty account
-            msg = "Created empty account (no initial deposit)."
+        if initial_deposit is None or initial_deposit <= 0:
+            # allow creating account with zero deposit
+            _account = Account(user_id=user_id, initial_deposit=0.0)
+            return f"Account created for '{user_id}' with no initial deposit."
         else:
-            try:
-                dec = Decimal(initial_deposit)
-            except InvalidOperation:
-                return ("Invalid initial deposit amount.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-            acct = Account(initial_deposit=dec)
-            msg = f"Created account with initial deposit {fmt_money(dec)}."
-        return (msg, account_to_summary_dict(acct), transactions_to_list(acct), acct)
-    except Exception as e:
-        return (f"Error creating account: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-
-
-def handle_deposit(amount: str, note: str, acct_state: Optional[Account]):
-    if acct_state is None:
-        return ("No account exists. Create an account first.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    try:
-        dec = Decimal(amount)
-    except InvalidOperation:
-        return ("Invalid deposit amount.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    try:
-        txn = acct_state.deposit(dec, note=note or None)
-        msg = f"Deposited {fmt_money(txn.amount)}. New cash balance: {fmt_money(txn.cash_balance_after)}."
-        return (msg, account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+            _account = Account(user_id=user_id, initial_deposit=float(initial_deposit))
+            return f"Account created for '{user_id}' with initial deposit {_fmt_money(initial_deposit)}."
     except AccountError as e:
-        return (f"Deposit failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        return f"Account creation error: {e}"
     except Exception as e:
-        return (f"Unexpected error during deposit: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        return f"Unexpected error: {e}"
 
-
-def handle_withdraw(amount: str, note: str, acct_state: Optional[Account]):
-    if acct_state is None:
-        return ("No account exists. Create an account first.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+def deposit(amount: float, note: str):
     try:
-        dec = Decimal(amount)
-    except InvalidOperation:
-        return ("Invalid withdraw amount.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    try:
-        txn = acct_state.withdraw(dec, note=note or None)
-        msg = f"Withdrew {fmt_money(-txn.amount)}. New cash balance: {fmt_money(txn.cash_balance_after)}."
-        return (msg, account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except InsufficientFundsError as e:
-        return (f"Withdrawal denied: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except AccountError as e:
-        return (f"Withdraw failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        _ensure_account()
+        tx = _account.deposit(float(amount), note=note or None)
+        return f"Deposit successful: {tx.total:+.2f}. New cash balance: {_fmt_money(_account.get_cash_balance())}"
     except Exception as e:
-        return (f"Unexpected error during withdraw: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        return f"Deposit failed: {e}"
 
-
-def handle_buy(symbol: str, quantity: int, acct_state: Optional[Account]):
-    if acct_state is None:
-        return ("No account exists. Create an account first.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    if not symbol:
-        return ("Symbol is required for buy.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+def withdraw(amount: float, note: str):
     try:
-        qty = int(quantity)
-    except Exception:
-        return ("Invalid quantity.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    try:
-        txn = acct_state.buy(symbol, qty)  # uses default price provider
-        msg = f"Bought {txn.quantity} shares of {txn.symbol} at {fmt_money(txn.price)} each for total {fmt_money(-txn.amount)}. New cash: {fmt_money(txn.cash_balance_after)}."
-        return (msg, account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except InsufficientFundsError as e:
-        return (f"Buy denied: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except PriceLookupError as e:
-        return (f"Price lookup failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except AccountError as e:
-        return (f"Buy failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        _ensure_account()
+        tx = _account.withdraw(float(amount), note=note or None)
+        return f"Withdraw successful: {tx.total:+.2f}. New cash balance: {_fmt_money(_account.get_cash_balance())}"
     except Exception as e:
-        return (f"Unexpected error during buy: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        return f"Withdraw failed: {e}"
 
-
-def handle_sell(symbol: str, quantity: int, acct_state: Optional[Account]):
-    if acct_state is None:
-        return ("No account exists. Create an account first.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    if not symbol:
-        return ("Symbol is required for sell.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+def buy(symbol: str, quantity: float):
     try:
-        qty = int(quantity)
-    except Exception:
-        return ("Invalid quantity.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    try:
-        txn = acct_state.sell(symbol, qty)
-        msg = f"Sold {txn.quantity} shares of {txn.symbol} at {fmt_money(txn.price)} each for total {fmt_money(txn.amount)}. New cash: {fmt_money(txn.cash_balance_after)}."
-        return (msg, account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except InsufficientSharesError as e:
-        return (f"Sell denied: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except PriceLookupError as e:
-        return (f"Price lookup failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
-    except AccountError as e:
-        return (f"Sell failed: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        _ensure_account()
+        if not symbol:
+            return "Buy failed: symbol required."
+        tx = _account.buy(symbol, float(quantity))
+        return (f"Bought {tx.quantity} {tx.symbol} @ {_fmt_money(tx.price)} each. "
+                f"Cash after trade: {_fmt_money(_account.get_cash_balance())}")
     except Exception as e:
-        return (f"Unexpected error during sell: {str(e)}", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+        return f"Buy failed: {e}"
 
+def sell(symbol: str, quantity: float):
+    try:
+        _ensure_account()
+        if not symbol:
+            return "Sell failed: symbol required."
+        tx = _account.sell(symbol, float(quantity))
+        return (f"Sold {tx.quantity} {tx.symbol} @ {_fmt_money(tx.price)} each. "
+                f"Cash after trade: {_fmt_money(_account.get_cash_balance())}")
+    except Exception as e:
+        return f"Sell failed: {e}"
 
-def handle_refresh(acct_state: Optional[Account]):
-    return ("Refreshed.", account_to_summary_dict(acct_state), transactions_to_list(acct_state), acct_state)
+def show_holdings():
+    try:
+        _ensure_account()
+        holdings = _account.get_holdings()
+        if not holdings:
+            return "No holdings."
+        lines = []
+        total_positions_value = 0.0
+        for sym, pos in holdings.items():
+            price = get_share_price(sym)
+            value = price * pos.quantity
+            total_positions_value += value
+            lines.append(f"{sym}: qty={pos.quantity} avg_cost={_fmt_money(pos.avg_cost)} "
+                         f"market_price={_fmt_money(price)} value={_fmt_money(value)}")
+        lines.append(f"Cash: {_fmt_money(_account.get_cash_balance())}")
+        lines.append(f"Total positions value: {_fmt_money(total_positions_value)}")
+        lines.append(f"Portfolio value (cash + positions): {_fmt_money(_account.get_portfolio_value())}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error showing holdings: {e}"
 
+def show_portfolio():
+    try:
+        _ensure_account()
+        cash = _account.get_cash_balance()
+        pv = _account.get_portfolio_value()
+        pnl_initial = _account.get_profit_loss(reference='initial')
+        pnl_net = _account.get_profit_loss(reference='net_invested')
+        pnl_break = _account.get_realized_unrealized_pnl_breakdown()
+        lines = [
+            f"Cash: {_fmt_money(cash)}",
+            f"Portfolio value (cash + positions): {_fmt_money(pv)}",
+            f"Profit/Loss vs initial deposit: {_fmt_money(pnl_initial)}",
+            f"Profit/Loss vs net invested: {_fmt_money(pnl_net)}",
+            f"Realized PnL: {_fmt_money(pnl_break['realized_pnl'])}",
+            f"Unrealized PnL: {_fmt_money(pnl_break['unrealized_pnl'])}",
+            f"Total PnL: {_fmt_money(pnl_break['total_pnl'])}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error showing portfolio: {e}"
+
+def list_transactions(limit: int = 50):
+    try:
+        _ensure_account()
+        txs = _account.list_transactions()
+        if not txs:
+            return "No transactions."
+        lines = []
+        # show most recent first
+        for tx in sorted(txs, key=lambda t: t.timestamp, reverse=True)[:limit]:
+            ts = tx.timestamp.isoformat()
+            typ = tx.type
+            sym = tx.symbol or ""
+            qty = f"{tx.quantity}" if tx.quantity is not None else ""
+            price = _fmt_money(tx.price) if tx.price is not None else ""
+            total = _fmt_money(tx.total)
+            bal = _fmt_money(tx.balance_after)
+            note = f" note={tx.note}" if tx.note else ""
+            lines.append(f"{ts} | {typ.upper():6} | {sym:5} | qty={qty:7} price={price:10} total={total:10} balance={bal:10}{note}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing transactions: {e}"
+
+def refresh_summary():
+    try:
+        if _account is None:
+            return "No account."
+        return show_portfolio()
+    except Exception as e:
+        return f"Error refreshing: {e}"
 
 # Build Gradio UI
-
-
-with gr.Blocks(title="Trading Simulation Account Demo") as demo:
-    gr.Markdown("# Trading Simulation Account (Demo)")
-    gr.Markdown("Simple prototype UI to demonstrate the Account backend. Uses test prices for AAPL, TSLA, GOOGL.")
+with gr.Blocks(title="Trading Account Demo") as demo:
+    gr.Markdown("# Simple Trading Account Demo")
+    gr.Markdown("Create an account, deposit/withdraw cash, buy/sell shares (AAPL/TSLA/GOOGL supported).")
 
     with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("## Account Creation")
-            initial_deposit = gr.Textbox(label="Initial deposit (optional, e.g. 10000)", placeholder="e.g. 10000")
+        with gr.Column():
+            user_id = gr.Textbox(label="User ID", value="demo_user", info="Single-user demo")
+            initial_deposit = gr.Number(label="Initial deposit (USD)", value=10000.0)
             create_btn = gr.Button("Create Account")
+            create_out = gr.Textbox(label="Create Account Output", interactive=False)
+        with gr.Column():
+            refresh_btn = gr.Button("Refresh Portfolio Summary")
+            summary_out = gr.Textbox(label="Portfolio Summary", lines=8, interactive=False)
+            holdings_btn = gr.Button("Show Holdings")
+            holdings_out = gr.Textbox(label="Holdings", lines=8, interactive=False)
 
-            gr.Markdown("## Cash Operations")
-            deposit_amt = gr.Textbox(label="Deposit amount", placeholder="e.g. 500")
-            deposit_note = gr.Textbox(label="Deposit note (optional)")
+    with gr.Row():
+        with gr.Column():
+            gr.Markdown("### Cash operations")
+            deposit_amt = gr.Number(label="Deposit Amount", value=1000.0)
+            deposit_note = gr.Textbox(label="Deposit Note (optional)")
             deposit_btn = gr.Button("Deposit")
+            deposit_out = gr.Textbox(label="Deposit Output", interactive=False)
 
-            withdraw_amt = gr.Textbox(label="Withdraw amount", placeholder="e.g. 200")
-            withdraw_note = gr.Textbox(label="Withdraw note (optional)")
+            withdraw_amt = gr.Number(label="Withdraw Amount", value=500.0)
+            withdraw_note = gr.Textbox(label="Withdraw Note (optional)")
             withdraw_btn = gr.Button("Withdraw")
-
-            gr.Markdown("## Trades")
-            buy_symbol = gr.Textbox(label="Buy symbol", placeholder="AAPL, TSLA, GOOGL")
-            buy_qty = gr.Number(label="Buy quantity", value=1, precision=0)
+            withdraw_out = gr.Textbox(label="Withdraw Output", interactive=False)
+        with gr.Column():
+            gr.Markdown("### Trade operations")
+            trade_symbol = gr.Textbox(label="Symbol (AAPL/TSLA/GOOGL)", value="AAPL")
+            trade_qty = gr.Number(label="Quantity", value=1)
             buy_btn = gr.Button("Buy")
-
-            sell_symbol = gr.Textbox(label="Sell symbol", placeholder="AAPL, TSLA, GOOGL")
-            sell_qty = gr.Number(label="Sell quantity", value=1, precision=0)
+            buy_out = gr.Textbox(label="Buy Output", interactive=False)
             sell_btn = gr.Button("Sell")
+            sell_out = gr.Textbox(label="Sell Output", interactive=False)
 
-        with gr.Column(scale=1):
-            gr.Markdown("## Account Info")
-            status = gr.Textbox(label="Status", interactive=False)
-            summary = gr.JSON(label="Summary")
-            txns = gr.JSON(label="Transactions")
+    with gr.Row():
+        tx_btn = gr.Button("List Transactions")
+        tx_out = gr.Textbox(label="Transactions", lines=12, interactive=False)
 
-            refresh_btn = gr.Button("Refresh Summary")
+    # Bind actions
+    create_btn.click(fn=create_account, inputs=[user_id, initial_deposit], outputs=create_out)
+    deposit_btn.click(fn=deposit, inputs=[deposit_amt, deposit_note], outputs=deposit_out)
+    withdraw_btn.click(fn=withdraw, inputs=[withdraw_amt, withdraw_note], outputs=withdraw_out)
+    buy_btn.click(fn=buy, inputs=[trade_symbol, trade_qty], outputs=buy_out)
+    sell_btn.click(fn=sell, inputs=[trade_symbol, trade_qty], outputs=sell_out)
 
-    # Hidden state to hold the Account instance
-    acct_state = gr.State(value=None)
+    holdings_btn.click(fn=show_holdings, inputs=None, outputs=holdings_out)
+    tx_btn.click(fn=list_transactions, inputs=[], outputs=tx_out)
+    refresh_btn.click(fn=refresh_summary, inputs=None, outputs=summary_out)
 
-    # Wire buttons
-    create_btn.click(fn=handle_create_account, inputs=[initial_deposit, acct_state], outputs=[status, summary, txns, acct_state])
-    deposit_btn.click(fn=handle_deposit, inputs=[deposit_amt, deposit_note, acct_state], outputs=[status, summary, txns, acct_state])
-    withdraw_btn.click(fn=handle_withdraw, inputs=[withdraw_amt, withdraw_note, acct_state], outputs=[status, summary, txns, acct_state])
-    buy_btn.click(fn=handle_buy, inputs=[buy_symbol, buy_qty, acct_state], outputs=[status, summary, txns, acct_state])
-    sell_btn.click(fn=handle_sell, inputs=[sell_symbol, sell_qty, acct_state], outputs=[status, summary, txns, acct_state])
-    refresh_btn.click(fn=handle_refresh, inputs=[acct_state], outputs=[status, summary, txns, acct_state])
+    # Also update summary/holdings after operations by chaining (simple UX)
+    def _after_op(_):
+        # return updated portfolio summary and holdings and transactions
+        return show_portfolio(), show_holdings(), list_transactions()
+    # attach to several buttons to update the summary blocks and transactions
+    deposit_btn.click(fn=_after_op, inputs=None, outputs=[summary_out, holdings_out, tx_out])
+    withdraw_btn.click(fn=_after_op, inputs=None, outputs=[summary_out, holdings_out, tx_out])
+    buy_btn.click(fn=_after_op, inputs=None, outputs=[summary_out, holdings_out, tx_out])
+    sell_btn.click(fn=_after_op, inputs=None, outputs=[summary_out, holdings_out, tx_out])
+    create_btn.click(fn=_after_op, inputs=None, outputs=[summary_out, holdings_out, tx_out])
 
 if __name__ == "__main__":
     demo.launch()
