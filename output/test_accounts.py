@@ -1,163 +1,177 @@
-import os
-import csv
-import tempfile
-from decimal import Decimal
-from datetime import datetime, timedelta
 import pytest
+from datetime import datetime, timedelta
+import copy
 
 import accounts
+from accounts import Account, Transaction, Position
 from accounts import (
-    Account,
-    Transaction,
-    PriceLookupError,
+    AccountError,
+    InvalidAmountError,
     InsufficientFundsError,
     InsufficientSharesError,
-    InvalidTransactionError,
-    _quantize_money,
+    UnknownSymbolError,
+    TransactionError,
+    get_share_price,
 )
 
 
-def test_initial_deposit_and_deposit_behavior():
-    ts = datetime(2021, 1, 1, 12, 0, 0)
-    acct = Account(account_id="acct1", initial_deposit=Decimal('100.00'), timestamp=ts)
-    # initial deposit should be recorded
-    assert acct._initial_deposit == Decimal('100.00')
-    assert acct.get_cash_balance() == Decimal('100.00')
-    # make another deposit; initial_deposit should stay the same
-    txn = acct.deposit(Decimal('50.00'), timestamp=ts + timedelta(minutes=1), note='second')
-    assert txn.type == 'deposit'
-    assert txn.note == 'second'
-    assert acct._initial_deposit == Decimal('100.00')
-    assert acct.get_cash_balance() == Decimal('150.00')
+def test_get_share_price_known_symbols_case_insensitive():
+    assert get_share_price('AAPL') == 150.0
+    assert get_share_price('aapl') == 150.0
+    assert get_share_price('TsLa') == 700.0
+    assert get_share_price('GOOGL') == 2800.0
 
-def test_invalid_deposits():
-    acct = Account()
-    with pytest.raises(InvalidTransactionError):
-        acct.deposit(Decimal('-10'))
-    with pytest.raises(InvalidTransactionError):
-        acct.deposit(None)
+def test_get_share_price_unknown_raises():
+    with pytest.raises(UnknownSymbolError):
+        get_share_price('UNKNOWN')
+    with pytest.raises(UnknownSymbolError):
+        get_share_price(None)
 
-def test_withdraw_success_and_insufficient():
-    acct = Account()
-    acct.deposit(Decimal('200.00'))
-    wtxn = acct.withdraw(Decimal('50.00'))
-    assert wtxn.type == 'withdraw'
-    assert acct.get_cash_balance() == Decimal('150.00')
+def test_account_init_and_initial_deposit_validation():
+    with pytest.raises(ValueError):
+        Account('', initial_deposit=0)
+    with pytest.raises(InvalidAmountError):
+        Account('u1', initial_deposit=-10)
+    # valid initial deposit records a deposit transaction
+    acct = Account('user_init', initial_deposit=100.0)
+    assert acct.get_cash_balance() == 100.0
+    assert acct.total_deposits() == 100.0
+    txs = acct.list_transactions()
+    assert len(txs) == 1
+    assert txs[0].type == 'deposit'
+    assert txs[0].note == 'initial_deposit'
+
+def test_deposit_and_withdraw_flow_and_errors():
+    acct = Account('u2')
+    with pytest.raises(InvalidAmountError):
+        acct.deposit(0)
+    tx = acct.deposit(250.567)
+    # rounding to cents
+    assert acct.get_cash_balance() == 250.57
+    assert tx.total == 250.57
+    assert acct.total_deposits() == 250.57
+
+    with pytest.raises(InvalidAmountError):
+        acct.withdraw(0)
     with pytest.raises(InsufficientFundsError):
-        acct.withdraw(Decimal('1000.00'))
-    with pytest.raises(InvalidTransactionError):
-        acct.withdraw(None)
+        acct.withdraw(9999)
+    wtx = acct.withdraw(50.123)
+    assert acct.get_cash_balance() == 200.45  # 250.57 - 50.12
+    assert wtx.total == pytest.approx(-50.12, rel=1e-9)
+    assert acct.total_withdrawals() == pytest.approx(50.12, rel=1e-9)
 
-def test_buy_and_sell_and_holdings_and_portfolio_and_pl():
-    ts = datetime(2021, 6, 1, 10, 0, 0)
-    acct = Account(initial_deposit=Decimal('1000.00'), timestamp=ts)
-    # Buy 2 AAPL at provider price 150 => cost 300
-    btxn = acct.buy('AAPL', 2, timestamp=ts + timedelta(minutes=1))
-    assert btxn.type == 'buy'
-    assert btxn.quantity == 2
-    assert btxn.price == Decimal('150.00')
-    assert acct.get_cash_balance() == Decimal('700.00')
-    holdings = acct.get_holdings()
-    assert holdings == {'AAPL': 2}
-    # Sell 1 AAPL at explicit price 160
-    stxn = acct.sell('AAPL', 1, price=Decimal('160.00'), timestamp=ts + timedelta(minutes=2))
-    assert stxn.type == 'sell'
-    assert stxn.quantity == 1
-    assert acct.get_cash_balance() == Decimal('860.00')
-    holdings = acct.get_holdings()
-    assert holdings == {'AAPL': 1}
-    # Portfolio value uses provider price for AAPL (150)
-    pv = acct.get_portfolio_value()
-    # cash 860 + 1 * 150 = 1010
-    assert pv == Decimal('1010.00')
-    # Profit/loss initial: equity - initial_deposit = 1010 - 1000 = 10
-    pl = acct.get_profit_loss(basis='initial')
-    assert pl == Decimal('10.00')
-    # Profit/loss net: equity - net deposits (deposits - withdrawals). Net deposits = 1000
-    pl_net = acct.get_profit_loss(basis='net')
-    assert pl_net == Decimal('10.00')
-
-def test_insufficient_funds_for_buy_and_insufficient_shares_for_sell():
-    acct = Account()
-    acct.deposit(Decimal('100.00'))
+def test_buy_updates_positions_and_avg_cost_and_errors():
+    acct = Account('u3')
+    acct.deposit(1000.0)
+    # invalid symbol and amount
+    with pytest.raises(TransactionError):
+        acct.buy('', 1)
+    with pytest.raises(InvalidAmountError):
+        acct.buy('AAPL', 0)
+    # buy within funds
+    tx1 = acct.buy('AAPL', 2, price=100.0)
+    assert acct.get_cash_balance() == 800.0
+    pos = acct.get_holdings()['AAPL']
+    assert pos.quantity == 2
+    assert pos.avg_cost == 100.0
+    # buy additional shares at different price to change avg_cost
+    tx2 = acct.buy('AAPL', 3, price=110.0)
+    pos = acct.get_holdings()['AAPL']
+    assert pos.quantity == 5
+    # expected new avg cost = (2*100 + 3*110)/5 = 106.0
+    assert pos.avg_cost == 106.0
+    # Insufficient funds for a large buy
     with pytest.raises(InsufficientFundsError):
-        acct.buy('TSLA', 1, price=Decimal('700.00'))
-    acct2 = Account(initial_deposit=Decimal('1000.00'))
+        acct.buy('GOOGL', 1000)
+
+def test_sell_updates_cash_positions_realized_pnl_and_errors():
+    acct = Account('u4')
+    acct.deposit(1000.0)
+    acct.buy('AAPL', 5, price=100.0)
+    # invalid sell symbol and amount
+    with pytest.raises(TransactionError):
+        acct.sell('', 1)
+    with pytest.raises(InvalidAmountError):
+        acct.sell('AAPL', 0)
+    # insufficient shares
     with pytest.raises(InsufficientSharesError):
-        acct2.sell('AAPL', 1)
+        acct.sell('AAPL', 10)
+    # sell some shares at profit
+    prev_cash = acct.get_cash_balance()
+    sell_tx = acct.sell('AAPL', 2, price=120.0)
+    # proceeds = 240.00
+    assert acct.get_cash_balance() == prev_cash + 240.0
+    # realized pnl per share = 20*2 = 40
+    breakdown = acct.get_realized_unrealized_pnl_breakdown(lambda s: 120.0)
+    assert breakdown['realized_pnl'] == 40.0
+    # remaining position quantity
+    holdings = acct.get_holdings()
+    assert holdings['AAPL'].quantity == 3
+    # sell remaining shares to wipe position
+    acct.sell('AAPL', 3, price=100.0)  # no pnl on these
+    holdings = acct.get_holdings()
+    assert 'AAPL' not in holdings
 
-def test_price_lookup_errors_propagate():
-    def bad_provider(symbol, ts=None):
-        raise RuntimeError('no price')
-    acct = Account(initial_deposit=Decimal('500.00'))
-    with pytest.raises(accounts.PriceLookupError):
-        acct.buy('UNKNOWN', 1, price_provider=bad_provider)
-    # get_portfolio_value should propagate PriceLookupError when holdings exist and provider fails
-    acct.buy('AAPL', 1)
-    with pytest.raises(accounts.PriceLookupError):
-        acct.get_portfolio_value(price_provider=bad_provider)
+def test_get_holdings_returns_deep_copy():
+    acct = Account('u5')
+    acct.deposit(500.0)
+    acct.buy('TSLA', 1, price=100.0)
+    holdings = acct.get_holdings()
+    holdings['TSLA'].quantity = 9999
+    # original should not be modified
+    assert acct.get_holdings()['TSLA'].quantity == 1
 
-def test_list_transactions_filters_and_get_transaction_by_id():
-    base = datetime(2022, 1, 1, 9, 0, 0)
-    acct = Account()
-    t1 = acct.deposit(Decimal('100.00'), timestamp=base)
-    t2 = acct.deposit(Decimal('50.00'), timestamp=base + timedelta(hours=1))
-    t3 = acct.withdraw(Decimal('20.00'), timestamp=base + timedelta(hours=2))
-    all_txns = acct.list_transactions()
-    assert len(all_txns) == 3
-    # filter by start/end
-    mid_txns = acct.list_transactions(start=base + timedelta(minutes=30), end=base + timedelta(hours=1, minutes=30))
-    assert len(mid_txns) == 1
-    assert mid_txns[0].id == t2.id
-    # filter by types
-    deposits = acct.list_transactions(types=['deposit'])
-    assert all(txn.type == 'deposit' for txn in deposits)
-    # get by id
-    assert acct.get_transaction_by_id(t3.id).id == t3.id
-    assert acct.get_transaction_by_id('nonexistent') is None
+def test_portfolio_value_with_custom_resolver_and_defaults():
+    acct = Account('u6')
+    acct.deposit(1000.0)
+    acct.buy('AAPL', 2, price=150.0)
+    # default resolver for AAPL returns 150.0, so portfolio = cash + 2*150
+    expected = acct.get_cash_balance() + 2 * 150.0
+    assert acct.get_portfolio_value() == expected
+    # custom resolver that sets AAPL to 200
+    assert acct.get_portfolio_value(lambda s: 200.0) == acct.get_cash_balance() + 2 * 200.0
 
-def test_to_dict_and_load_from_dict_roundtrip():
-    acct = Account(initial_deposit=Decimal('300.00'))
-    acct.buy('AAPL', 1)
-    acct.deposit(Decimal('50.00'))
+def test_profit_loss_vs_initial_and_net_invested():
+    acct = Account('u7')
+    acct.deposit(1000.0)
+    acct.buy('AAPL', 2, price=150.0)
+    # change price to compute portfolio
+    pl_initial = acct.get_profit_loss('initial', lambda s: 150.0)
+    assert pl_initial == pytest.approx(0.0, abs=1e-9)
+    # deposit more and withdraw
+    acct.deposit(100.0)
+    acct.withdraw(50.0)
+    # net_invested = deposits - withdrawals = 1100 - 50 = 1050
+    pl_net = acct.get_profit_loss('net_invested', lambda s: 150.0)
+    assert pl_net == acct.get_portfolio_value(lambda s: 150.0) - acct.total_deposits() + acct.total_withdrawals() + 0  # sanity check
+
+def test_list_transactions_filters():
+    acct = Account('u8')
+    t0 = datetime.utcnow()
+    acct.deposit(100.0, timestamp=t0 - timedelta(seconds=10))
+    acct.buy('AAPL', 1, price=150.0, timestamp=t0)
+    acct.sell('AAPL', 1, price=160.0, timestamp=t0 + timedelta(seconds=10))
+    # filter by type
+    deposits = acct.list_transactions(tx_type='deposit')
+    assert len(deposits) == 1
+    buys = acct.list_transactions(tx_type='buy')
+    assert len(buys) == 1
+    # filter by symbol
+    sells_aapl = acct.list_transactions(symbol='AAPL')
+    assert len(sells_aapl) == 2  # buy and sell
+    # filter by time window
+    middle = acct.list_transactions(start=t0 - timedelta(seconds=1), end=t0 + timedelta(seconds=1))
+    assert len(middle) == 1
+
+def test_serialization_roundtrip():
+    acct = Account('u9')
+    acct.deposit(1000.0)
+    acct.buy('AAPL', 2, price=150.0)
+    acct.sell('AAPL', 1, price=155.0)
     data = acct.to_dict()
-    loaded = Account.load_from_dict(data)
-    assert loaded.account_id == data['account_id']
-    assert loaded.get_cash_balance() == acct.get_cash_balance()
-    assert loaded.get_holdings() == acct.get_holdings()
-    assert len(loaded.list_transactions()) == len(acct.list_transactions())
-
-def test_reconcile_holdings_detects_negative():
-    ts = datetime(2023, 1, 1, 9, 0, 0)
-    acct = Account(initial_deposit=Decimal('500.00'), timestamp=ts)
-    acct.buy('AAPL', 1, timestamp=ts + timedelta(minutes=1))
-    # craft a sell of 2 shares (greater than held) and append directly
-    bad_sell = Transaction(
-        id='bad1',
-        timestamp=ts + timedelta(minutes=2),
-        type='sell',
-        amount=Decimal('300.00'),
-        symbol='AAPL',
-        quantity=2,
-        price=Decimal('150.00'),
-        cash_balance_after=Decimal('0'),
-        note='corrupted',
-    )
-    # append using internal method (it will accept as it doesn't validate holdings)
-    acct._append_transaction(bad_sell)
-    with pytest.raises(AssertionError):
-        acct.reconcile_holdings()
-
-def test_export_transactions_csv_writes_file(tmp_path):
-    acct = Account()
-    acct.deposit(Decimal('100.00'))
-    acct.buy('AAPL', 1)
-    fp = tmp_path / "txns.csv"
-    acct.export_transactions_csv(str(fp))
-    assert fp.exists()
-    with open(fp, newline='') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
-    # header + number of transactions
-    assert rows[0] == ['id', 'timestamp', 'type', 'amount', 'symbol', 'quantity', 'price', 'cash_balance_after', 'note']
-    assert len(rows) == 1 + len(acct.list_transactions())
+    acct2 = Account.from_dict(data)
+    assert acct2.get_cash_balance() == acct.get_cash_balance()
+    assert acct2._initial_deposit == acct._initial_deposit
+    # positions and transactions lengths
+    assert len(acct2.get_holdings()) == len(acct.get_holdings())
+    assert len(acct2.list_transactions()) == len(acct.list_transactions())
