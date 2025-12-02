@@ -11,32 +11,32 @@ This collaborative crew excels at tackling Python-based coding tasks. In this pr
 ## Key Features with Screenshots of the Account Management System the Engineering team is created:
 
 
-- **Creating Account entering User ID and Initial Deposit**
+##1. **Creating Account entering User ID and Initial Deposit**
 
 ![Creating Account entering User ID and Initial Deposit](https://github.com/satyamnag/CodeCrew/blob/main/assets/1.%20Creating%20Account.png?raw=true)
 
 
-- **Cash Deposit**
+##2. **Cash Deposit**
 
 ![Cash Deposit](https://github.com/satyamnag/CodeCrew/blob/main/assets/2.%20Cash%20Deposite.png?raw=true)
 
 
-- **Cash Withdrawal**
+##3. **Cash Withdrawal**
 
 ![Cash Withdrawal](https://github.com/satyamnag/CodeCrew/blob/main/assets/3.%20Cash%20Withdrawal.png?raw=true)
 
 
-- **Buying Shares**
+##4. **Buying Shares**
 
 ![Buying Shares](https://github.com/satyamnag/CodeCrew/blob/main/assets/4.%20Buying%20Shares.png?raw=true)
 
 
-- **Selling Shares**
+##5. **Selling Shares**
 
 ![Selling Shares](https://github.com/satyamnag/CodeCrew/blob/main/assets/5.%20Selling%20Shares.png?raw=true)
 
 
-- **Portfolio Summary and Holdings**
+##6. **Portfolio Summary and Holdings**
 
 ![Portfolio Summary and Holdings](https://github.com/satyamnag/CodeCrew/blob/main/assets/6.%20Portfolio%20Summary%20and%20Holdings.png?raw=true)
 
@@ -44,5 +44,6 @@ This collaborative crew excels at tackling Python-based coding tasks. In this pr
 - **List of all Transactions**
 
 ![All Transactions](https://github.com/satyamnag/CodeCrew/blob/main/assets/7.%20All%20Transactions.png?raw=true)
+
 
 
