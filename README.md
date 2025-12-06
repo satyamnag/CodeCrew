@@ -8,10 +8,10 @@
 
 This collaborative crew excels at tackling Python-based coding tasks. In this project, we've developed a **simple Account Management System** for a **Trading Simulation Platform**.  
 
-## Key Features with Screenshots of the Account Management System the Engineering team is created:
+## Key Features with Screenshots of the Account Management System created by the Engineering team:
 
 
-##1. **Creating Account entering User ID and Initial Deposit**
+##1. **Creating Account by entering User ID and Initial Deposit**
 
 ![Creating Account entering User ID and Initial Deposit](https://github.com/satyamnag/CodeCrew/blob/main/assets/1.%20Creating%20Account.png?raw=true)
 
@@ -44,6 +44,7 @@ This collaborative crew excels at tackling Python-based coding tasks. In this pr
 - **List of all Transactions**
 
 ![All Transactions](https://github.com/satyamnag/CodeCrew/blob/main/assets/7.%20All%20Transactions.png?raw=true)
+
 
 
 
